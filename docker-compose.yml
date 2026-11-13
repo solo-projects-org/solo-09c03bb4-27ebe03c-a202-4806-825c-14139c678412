@@ -1,0 +1,16 @@
+services:
+  deid:
+    build: .
+    image: ct-deid:latest
+    container_name: ct-deid
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      DEID_WORKERS: "2"   # 并行批次数:两批可并行,慢打包不阻塞另一批
+    volumes:
+      - deid-data:/data   # 数据卷:SQLite 映射库 + 结果包 + 患者代号密钥
+    restart: unless-stopped
+
+volumes:
+  deid-data:

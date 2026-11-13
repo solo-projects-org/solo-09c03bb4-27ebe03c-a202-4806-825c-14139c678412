@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.git/
+sample_data/
+*.zip
+deid.db*
