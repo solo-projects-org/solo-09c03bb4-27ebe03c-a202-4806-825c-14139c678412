@@ -1,4 +1,4 @@
-"""批次处理核心:校验 -> 重编 UID -> 去标识化 -> 打包 -> 登记映射。
+"""批次处理核心:校验 -> 重编 UID -> 去标识化 -> 打包 -> 登记映射 -> 残件清理。
 
 设计要点:
 - 校验(缺患者号 / 包外实例引用 / BurnedInAnnotation != NO)任一不满足,整批拒收。
@@ -6,7 +6,10 @@
 - 检查/序列/实例 UID 全部重编;按"值"递归替换,序列内嵌套引用同步改写;
   SOP Class UID 与 Transfer Syntax UID 不在映射表内,天然保持不变;像素数据不触碰。
 - 完整包落盘 + 映射登记在同一先后序列里都成功,批次才置为 COMPLETED 供下载。
-- 失败时仅清除本批独占的 uid_map 记录,患者代号等全局映射不动,不影响其他成功批。
+- 残件清理(失败/中断批的原包、临时目录、未发布结果、独占映射)以
+  cleanup_targets 表为持久化"待清理依据":删除成功才标记 DONE;
+  权限错误等删除失败会保留依据,由后台补清线程自动重试,服务可正常启动,
+  故障解除后无须重启即补清。清单路径即白名单,补清绝不删除新批次的在途文件。
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ import logging
 import os
 import secrets
 import shutil
+import threading
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -26,8 +30,11 @@ from pydicom.dataset import Dataset
 
 from . import db
 from .config import (
+    CLEANUP_INTERVAL,
     CT_IMAGE_STORAGE,
     EXPLICIT_VR_LITTLE_ENDIAN,
+    FAULT_DIR,
+    FAULT_INJECTION,
     OUTPUT_DIR,
     SECRET_PATH,
     TMP_DIR,
@@ -48,6 +55,32 @@ def new_uid() -> str:
 
 class BatchRejected(Exception):
     """业务校验失败 -> 整批拒收(REJECTED),消息可直接返回给调用方。"""
+
+
+# ---------------------------------------------------------------- 容错删除
+
+def _fault(name: str) -> None:
+    """演示/测试用故障注入:存在标记文件时模拟一次权限错误。"""
+    if FAULT_INJECTION and (FAULT_DIR / name).exists():
+        raise PermissionError(f"[fault-inject] 模拟权限拒绝: {name}")
+
+
+def remove_file(path: Path) -> None:
+    """删除单个文件;文件已不存在视为成功(删除天然幂等)。"""
+    _fault("delete_file")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def remove_tree(path: Path) -> None:
+    """删除整棵临时目录;目录已不存在视为成功。"""
+    _fault("rmtree")
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return
 
 
 # ---------------------------------------------------------------- 密钥 / 患者代号
@@ -208,8 +241,65 @@ def _set_status(batch_id: str, status: str, **fields) -> None:
         c.execute(sql, tuple(cols.values()) + (batch_id,))
 
 
+def _artifact_targets(batch_id: str, include_output: bool) -> list[tuple[str, str]]:
+    """本批次可能残留的磁盘工件清单(清理白名单)。
+
+    include_output=False(成功批):只清原包与临时目录,结果包必须保留可下载。
+    include_output=True (失败/中断批):连同未发布结果(含 .tmp 半成品)一起清。
+    """
+    targets = [
+        (str(UPLOAD_DIR / f"{batch_id}.zip"), "FILE"),
+        (str(TMP_DIR / batch_id), "DIR"),
+    ]
+    if include_output:
+        targets += [
+            (str(OUTPUT_DIR / f"{batch_id}.zip"), "FILE"),
+            (str(OUTPUT_DIR / f"{batch_id}.zip.tmp"), "FILE"),
+        ]
+    return targets
+
+
+def enqueue_cleanup(batch_id: str, include_output: bool = True) -> int:
+    """把本批残件登记进持久化清理清单并唤醒补清线程。返回登记条数。
+
+    已存在的条目(UNIQUE(batch_id, path))原样保留,因此失败重登记、
+    重启对账重复执行都不会丢掉待清理依据,也不会重置已完成的条目。
+    """
+    now = utcnow()
+    with db.tx() as c:
+        before = c.execute(
+            "SELECT COUNT(*) FROM cleanup_targets WHERE batch_id = ?", (batch_id,)
+        ).fetchone()[0]
+        c.executemany(
+            "INSERT OR IGNORE INTO cleanup_targets"
+            "(batch_id, path, kind, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+            [(batch_id, p, k, "PENDING", now, now)
+             for (p, k) in _artifact_targets(batch_id, include_output)],
+        )
+        total = c.execute(
+            "SELECT COUNT(*) FROM cleanup_targets WHERE batch_id = ?", (batch_id,)
+        ).fetchone()[0]
+        remaining = c.execute(
+            "SELECT COUNT(*) FROM cleanup_targets"
+            " WHERE batch_id = ? AND status != 'DONE'", (batch_id,)
+        ).fetchone()[0]
+        # 只要还有未删完的工件,批次清理进度就保持未完成
+        c.execute(
+            "UPDATE batches SET cleanup_status = ?, cleanup_total = ?,"
+            " cleanup_remaining = ?, cleaned_at = NULL, updated_at = ? WHERE batch_id = ?",
+            ("PENDING" if remaining else "DONE", total, remaining, now, batch_id),
+        )
+        added = total - before
+    sweeper.wake()
+    return added
+
+
 def _fail(batch_id: str, status: str, reason: str) -> None:
-    """失败/拒收清理:删本批独占的 UID 映射、删半成品包;全局患者映射不动。"""
+    """失败/拒收:独占 UID 映射随状态事务清除,磁盘残件交给持久化清理清单。
+
+    患者代号等全局映射不动,不影响其他成功批。即使删除持续报权限错误,
+    批次仍能正确标记为 REJECTED/FAILED,服务启动与其他批次操作不受影响。
+    """
     log.warning("批次 %s %s: %s", batch_id, status, reason)
     with db.tx() as c:
         c.execute("DELETE FROM uid_map WHERE batch_id = ?", (batch_id,))
@@ -217,8 +307,7 @@ def _fail(batch_id: str, status: str, reason: str) -> None:
             "UPDATE batches SET status = ?, error = ?, updated_at = ? WHERE batch_id = ?",
             (status, reason, utcnow(), batch_id),
         )
-    for p in (OUTPUT_DIR / f"{batch_id}.zip", OUTPUT_DIR / f"{batch_id}.zip.tmp"):
-        p.unlink(missing_ok=True)
+    enqueue_cleanup(batch_id)
 
 
 # ---------------------------------------------------------------- 主流程
@@ -302,35 +391,235 @@ def process_batch(batch_id: str) -> None:
             )
         log.info("批次 %s 完成:%d 个实例 -> %s", batch_id, len(datasets), final_zip.name)
 
+        # 8. 成功批:结果包与映射保留,仅清原包与临时目录(同样走持久化清单)
+        enqueue_cleanup(batch_id, include_output=False)
+
     except BatchRejected as e:
         _fail(batch_id, "REJECTED", str(e))
     except Exception as e:  # noqa: BLE001 - 任何意外都不能拖垮工作线程
         log.exception("批次 %s 处理异常", batch_id)
         _fail(batch_id, "FAILED", f"内部错误: {e}")
-    finally:
-        # 处理结束(无论成败)删除原包与临时目录
-        upload_path.unlink(missing_ok=True)
-        shutil.rmtree(work_dir, ignore_errors=True)
 
 
-# ---------------------------------------------------------------- 重启恢复
+# ---------------------------------------------------------------- 后台补清
 
-def recover_interrupted() -> None:
-    """服务重启:完成包保留可下载;未完成批标记 FAILED 并清理其独占映射与半成品。"""
-    rows = db.query("SELECT batch_id FROM batches WHERE status IN ('PENDING','PROCESSING')")
-    for r in rows:
+class CleanupSweeper:
+    """后台补清线程:按节拍重试清理清单中未完成的条目。
+
+    - 独立守护线程,慢清理/反复失败只延迟本批残件删除,不占工作线程、不阻塞 API
+      与其他批次的上传/查询/下载/处理。
+    - 每条依据单独尝试、单独记账;实际删完才置 DONE,批次据此才报清理完成。
+    - 进程中途退出后,清单仍在 SQLite 里,下次启动由对账逻辑续清。
+    """
+
+    def __init__(self, interval: float = CLEANUP_INTERVAL):
+        self.interval = max(0.05, interval)
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._run_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="cleanup-sweeper", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=10)
+        self._thread = None
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.sweep_once()
+            except Exception:  # noqa: BLE001 - 补清线程永不因异常退出
+                log.exception("补清轮询发生异常,将在下一节拍重试")
+            self._wake.wait(timeout=self.interval)
+            self._wake.clear()
+
+    def sweep_once(self) -> int:
+        """执行一轮补清。同一时刻只有一轮在跑;返回本轮处理的批次数。"""
+        if not self._run_lock.acquire(blocking=False):
+            return 0
+        try:
+            self._reconcile_terminal_batches()
+            rows = db.query(
+                "SELECT DISTINCT batch_id FROM cleanup_targets WHERE status != 'DONE'"
+            )
+            for r in rows:
+                self._sweep_batch(r["batch_id"])
+            return len(rows)
+        finally:
+            self._run_lock.release()
+
+    def _reconcile_terminal_batches(self) -> None:
+        """对账:失败/拒收批盘上多出的未发布结果(外部误放、历史遗留)也要清掉。
+
+        只处理已有终态的批次及其 batch_id 命名的文件,不做通配扫描,
+        因此绝不会触碰在途批次或成功批的结果。
+        """
+        rows = db.query("SELECT batch_id FROM batches WHERE status IN ('REJECTED','FAILED')")
+        for r in rows:
+            bid = r["batch_id"]
+            for p in (OUTPUT_DIR / f"{bid}.zip", OUTPUT_DIR / f"{bid}.zip.tmp"):
+                if not p.exists():
+                    continue
+                now = utcnow()
+                with db.tx() as c:
+                    # 同路径可能已有历史 DONE 条目(文件被外部重新放回):
+                    # 先插入,再把该路径条目重新打开为 PENDING,确保补清会再删一次
+                    c.execute(
+                        "INSERT OR IGNORE INTO cleanup_targets"
+                        "(batch_id, path, kind, status, created_at, updated_at)"
+                        " VALUES (?,?, 'FILE', 'PENDING', ?, ?)",
+                        (bid, str(p), now, now),
+                    )
+                    c.execute(
+                        "UPDATE cleanup_targets SET status = 'PENDING', last_error = NULL,"
+                        " updated_at = ? WHERE batch_id = ? AND path = ? AND status = 'DONE'",
+                        (now, bid, str(p)),
+                    )
+                    c.execute(
+                        "UPDATE batches SET cleanup_status = 'PENDING', cleaned_at = NULL,"
+                        " updated_at = ? WHERE batch_id = ? AND cleanup_status = 'DONE'",
+                        (now, bid),
+                    )
+
+    def _sweep_batch(self, batch_id: str) -> None:
+        targets = db.query(
+            "SELECT * FROM cleanup_targets WHERE batch_id = ? AND status != 'DONE'"
+            " ORDER BY id",
+            (batch_id,),
+        )
+        if not targets:
+            return
+        db.query(  # 批次清理进度 -> IN_PROGRESS
+            "UPDATE batches SET cleanup_status = 'IN_PROGRESS', updated_at = ?"
+            " WHERE batch_id = ? AND cleanup_status != 'DONE'",
+            (utcnow(), batch_id),
+        )
+        for t in targets:
+            self._attempt_target(t)
+        self._refresh_batch(batch_id)
+
+    def _attempt_target(self, target) -> None:
+        tid = target["id"]
+        path = Path(target["path"])
+        now = utcnow()
+        try:
+            if target["kind"] == "DIR":
+                remove_tree(path)
+            else:
+                remove_file(path)
+        except Exception as e:  # noqa: BLE001 - 权限错误等:保留依据,下轮重试
+            log.warning("清理失败(将自动重试) target=%s: %s", path, e)
+            with db.tx() as c:
+                c.execute(
+                    "UPDATE cleanup_targets SET status = 'FAILED', attempts = attempts + 1,"
+                    " last_error = ?, updated_at = ? WHERE id = ?",
+                    (f"{type(e).__name__}: {e}", now, tid),
+                )
+                c.execute(
+                    "UPDATE batches SET cleanup_status = 'FAILED', cleanup_error = ?,"
+                    " updated_at = ? WHERE batch_id = ?",
+                    (f"{type(e).__name__}: {e}", now, target["batch_id"]),
+                )
+            return
+        with db.tx() as c:
+            c.execute(
+                "UPDATE cleanup_targets SET status = 'DONE', last_error = NULL,"
+                " updated_at = ? WHERE id = ?",
+                (now, tid),
+            )
+
+    def _refresh_batch(self, batch_id: str) -> None:
+        now = utcnow()
+        row = db.query_one(
+            "SELECT COUNT(*) AS total,"
+            " SUM(CASE WHEN status != 'DONE' THEN 1 ELSE 0 END) AS remaining"
+            " FROM cleanup_targets WHERE batch_id = ?",
+            (batch_id,),
+        )
+        total, remaining = row["total"], row["remaining"] or 0
+        if remaining:
+            err = db.query_one(
+                "SELECT last_error FROM cleanup_targets WHERE batch_id = ?"
+                " AND status != 'DONE' ORDER BY updated_at DESC LIMIT 1",
+                (batch_id,),
+            )
+            with db.tx() as c:
+                c.execute(
+                    "UPDATE batches SET cleanup_status = 'FAILED', cleanup_total = ?,"
+                    " cleanup_remaining = ?, cleanup_error = ?, updated_at = ?"
+                    " WHERE batch_id = ?",
+                    (total, remaining, err["last_error"] if err else None, now, batch_id),
+                )
+        else:
+            with db.tx() as c:
+                c.execute(
+                    "UPDATE batches SET cleanup_status = 'DONE', cleanup_total = ?,"
+                    " cleanup_remaining = 0, cleanup_error = NULL, cleaned_at = ?,"
+                    " updated_at = ? WHERE batch_id = ?",
+                    (total, now, now, batch_id),
+                )
+            log.info("批次 %s 残件已全部清理完成", batch_id)
+
+
+sweeper = CleanupSweeper()
+
+
+# ---------------------------------------------------------------- 重启恢复 / 旧卷对账
+
+def recover_and_reconcile() -> None:
+    """启动时对账,兼容已有数据卷(含已标失败但仍有残件的批次)。
+
+    分两类:
+    1. PENDING/PROCESSING(上次进程中断):标 FAILED、清独占映射,全部残件入清理清单。
+    2. REJECTED/FAILED(旧版本遗留,可能标记在前、残件未删):补登记清理清单续清。
+    COMPLETED 批的结果包与映射一律保留。
+
+    清理依据只按批次精确登记(路径白名单),不做目录通配清扫,
+    因此绝不会误删重启后新上传批次的在途文件。
+    """
+    now = utcnow()
+
+    interrupted = db.query("SELECT batch_id FROM batches WHERE status IN ('PENDING','PROCESSING')")
+    for r in interrupted:
         bid = r["batch_id"]
         with db.tx() as c:
             c.execute("DELETE FROM uid_map WHERE batch_id = ?", (bid,))
             c.execute(
-                "UPDATE batches SET status = 'FAILED', error = ?, updated_at = ? WHERE batch_id = ?",
-                ("服务重启,批次中断,未发布", utcnow(), bid),
+                "UPDATE batches SET status = 'FAILED', error = ?,"
+                " updated_at = ? WHERE batch_id = ?",
+                ("服务重启,批次中断,未发布", now, bid),
             )
-        (OUTPUT_DIR / f"{bid}.zip").unlink(missing_ok=True)
-        (OUTPUT_DIR / f"{bid}.zip.tmp").unlink(missing_ok=True)
-        log.info("重启清理:批次 %s 标记为 FAILED", bid)
-    # 启动时没有任何批次在途,上传区/临时区里的一律是残留
-    for p in UPLOAD_DIR.glob("*"):
-        p.unlink(missing_ok=True)
-    for p in TMP_DIR.glob("*"):
-        shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
+        enqueue_cleanup(bid)
+        log.info("重启恢复:中断批次 %s 标记为 FAILED 并登记清理", bid)
+
+    legacy = db.query(
+        "SELECT b.batch_id FROM batches b WHERE b.status IN ('REJECTED','FAILED')"
+        " AND NOT EXISTS ("
+        "  SELECT 1 FROM cleanup_targets t WHERE t.batch_id = b.batch_id)"
+    )
+    for r in legacy:
+        bid = r["batch_id"]
+        # 旧卷里可能已残留本批独占映射,幂等清除
+        with db.tx() as c:
+            c.execute("DELETE FROM uid_map WHERE batch_id = ?", (bid,))
+        enqueue_cleanup(bid)
+        log.info("旧卷对账:失败批次 %s 补登记清理清单", bid)
+
+    # 已登记过清单的批次(含清理中途退出的)无需额外动作,
+    # 未完成条目由 sweeper 依据 SQLite 中的依据自动续清。
+    sweeper.wake()

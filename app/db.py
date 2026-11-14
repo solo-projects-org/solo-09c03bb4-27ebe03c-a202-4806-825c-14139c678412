@@ -1,9 +1,12 @@
 """SQLite 映射库。
 
-三张表:
-- patients: 原始患者号 -> 稳定代号(全局唯一映射,跨批共享,失败批不删除)
-- uid_map : (批次, 原始UID) -> 新UID(批次独占,失败批整体清除)
-- batches : 批次状态机
+四张表:
+- patients       : 原始患者号 -> 稳定代号(全局唯一映射,跨批共享,失败批不删除)
+- uid_map        : (批次, 原始UID) -> 新UID(批次独占,失败/中断批整体清除)
+- batches        : 批次状态机;cleanup_* 三列记录清理进度,与处理结局相互独立
+- cleanup_targets: 待清理依据(删除清单)。每条残件一行,删除成功才标记 DONE;
+                   删除失败保留 PENDING/FAILED,由后台补清线程持续重试,
+                   中途退出也不丢失。路径即白名单,补清绝不会碰清单外的在途文件。
 
 单连接 + 全局锁 + WAL,保证并发批与重启后的一致性。
 """
@@ -44,9 +47,39 @@ CREATE TABLE IF NOT EXISTS batches (
     error             TEXT,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
-    completed_at      TEXT
+    completed_at      TEXT,
+    cleanup_status    TEXT NOT NULL DEFAULT 'NOT_REQUIRED',
+                                               -- NOT_REQUIRED/PENDING/IN_PROGRESS/DONE/FAILED
+    cleanup_total     INTEGER NOT NULL DEFAULT 0,
+    cleanup_remaining INTEGER NOT NULL DEFAULT 0,
+    cleanup_error     TEXT,
+    cleaned_at        TEXT
 );
+
+CREATE TABLE IF NOT EXISTS cleanup_targets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id   TEXT NOT NULL,
+    path       TEXT NOT NULL,               -- 待删残件的绝对路径(白名单)
+    kind       TEXT NOT NULL,               -- FILE / DIR
+    status     TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING/IN_PROGRESS/DONE/FAILED
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (batch_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_cleanup_status ON cleanup_targets(status);
+CREATE INDEX IF NOT EXISTS idx_cleanup_batch ON cleanup_targets(batch_id);
 """
+
+# 旧数据卷(无 cleanup_* 列)在线迁移
+_COLUMN_MIGRATIONS = {
+    "cleanup_status": "ALTER TABLE batches ADD COLUMN cleanup_status TEXT NOT NULL DEFAULT 'NOT_REQUIRED'",
+    "cleanup_total": "ALTER TABLE batches ADD COLUMN cleanup_total INTEGER NOT NULL DEFAULT 0",
+    "cleanup_remaining": "ALTER TABLE batches ADD COLUMN cleanup_remaining INTEGER NOT NULL DEFAULT 0",
+    "cleanup_error": "ALTER TABLE batches ADD COLUMN cleanup_error TEXT",
+    "cleaned_at": "ALTER TABLE batches ADD COLUMN cleaned_at TEXT",
+}
 
 
 def init() -> None:
@@ -59,6 +92,19 @@ def init() -> None:
         _conn.execute("PRAGMA busy_timeout=10000")
         _conn.execute("PRAGMA synchronous=NORMAL")
         _conn.executescript(SCHEMA)
+        existing = {r["name"] for r in _conn.execute("PRAGMA table_info(batches)")}
+        for col, ddl in _COLUMN_MIGRATIONS.items():
+            if col not in existing:
+                _conn.execute(ddl)
+
+
+def close() -> None:
+    """关闭连接(主要供进程内重启测试使用)。"""
+    global _conn
+    with _lock:
+        if _conn is not None:
+            _conn.close()
+            _conn = None
 
 
 def conn() -> sqlite3.Connection:

@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import pydicom
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("DEID_BASE", "http://127.0.0.1:8000")
 SAMPLES = Path("sample_data")
 FAILURES: list[str] = []
 
@@ -41,6 +41,16 @@ def wait_done(batch_id: str, timeout: float = 60) -> dict:
                 return body
             time.sleep(0.1)
     raise TimeoutError(f"批次 {batch_id} 超时未完成")
+
+
+def wait_cleanup_done(batch_id: str, timeout: float = 60) -> dict:
+    with httpx.Client(base_url=BASE, timeout=30) as c:
+        for _ in range(int(timeout * 10)):
+            body = c.get(f"/api/batches/{batch_id}").json()
+            if body["cleanup_status"] == "DONE":
+                return body
+            time.sleep(0.1)
+    raise TimeoutError(f"批次 {batch_id} 清理超时")
 
 
 def download(batch_id: str) -> bytes:
@@ -166,6 +176,12 @@ def main() -> None:
         with httpx.Client(base_url=BASE, timeout=10) as c:
             r = c.get(f"/api/batches/{b}/download")
         check(r.status_code == 409, f"{fname} 拒收批不可下载(HTTP {r.status_code})")
+        # 未发布批的残件由后台补清清完,清理进度实际到 DONE
+        st = wait_cleanup_done(b)
+        check(st["cleanup_status"] == "DONE" and st["cleanup_remaining"] == 0,
+              f"{fname} 残件清理完成(cleanup_status=DONE)")
+        check(not (Path(os.environ.get("DEID_OUTPUT", "/tmp/deid-data/output")) / f"{b}.zip").exists(),
+              f"{fname} 未发布结果包不存在")
 
     print("== 6. 并发:两批并行 ==")
     import concurrent.futures as cf
@@ -189,9 +205,18 @@ def main() -> None:
     check(n_pat == 1, f"患者映射仅 1 条且跨批复用(实际 {n_pat})")
     con.close()
 
-    print("== 8. 原包已删除 ==")
+    print("== 8. 原包已删除(后台补清完成后上传区清空) ==")
     up = Path(os.environ.get("DEID_UPLOADS", "/tmp/deid-data/uploads"))
-    check(not any(up.iterdir()), "上传区已清空(原包处理完即删)")
+    deadline = time.time() + 30
+    while any(up.iterdir()) and time.time() < deadline:
+        time.sleep(0.2)
+    check(not any(up.iterdir()), "上传区已清空(原包经持久化清理清单删完)")
+
+    print("== 9. 成功批结果与映射保留,清理进度可见 ==")
+    info = httpx.Client(base_url=BASE, timeout=10).get(f"/api/batches/{b1}").json()
+    check(info["cleanup_status"] == "DONE", "成功批清理状态 DONE(仅原包/临时目录)")
+    check((Path(os.environ.get("DEID_OUTPUT", "/tmp/deid-data/output")) / f"{b1}.zip").exists(),
+          "成功批结果包保留可下载")
 
     print()
     if FAILURES:
